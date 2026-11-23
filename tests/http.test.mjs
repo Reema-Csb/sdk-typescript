@@ -1507,6 +1507,65 @@ test("the wait timeout includes an in-flight request and returns the retained re
   }
 });
 
+test("review waits can be cancelled during an in-flight request", async (t) => {
+  const fixture = await server(t, () => {});
+  const client = new ProoflineClient({ baseUrl: fixture.baseUrl, token });
+  const controller = new AbortController();
+  const reason = new Error("caller cancelled");
+
+  const waiting = client.waitForReview(orgId, reviewId, {
+    signal: controller.signal,
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  controller.abort(reason);
+
+  await assert.rejects(waiting, (error) => error === reason);
+  assert.equal(fixture.calls.length, 1);
+});
+
+test("review waits preserve the caller abort reason while reading a response body", async (t) => {
+  const fixture = await server(t, (_, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.write('{"id":');
+  });
+  const client = new ProoflineClient({ baseUrl: fixture.baseUrl, token });
+  const controller = new AbortController();
+  const reason = new Error("caller cancelled");
+
+  const waiting = client.waitForReview(orgId, reviewId, {
+    signal: controller.signal,
+  });
+
+  while (fixture.calls.length === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  controller.abort(reason);
+
+  await assert.rejects(waiting, (error) => error === reason);
+  assert.equal(fixture.calls.length, 1);
+});
+
+test("review waits can be cancelled during the polling delay", async (t) => {
+  const fixture = await server(t, (_, response) => {
+    json(response, 200, review("RUNNING"));
+  });
+  const client = new ProoflineClient({ baseUrl: fixture.baseUrl, token });
+  const controller = new AbortController();
+  const reason = new Error("caller cancelled");
+
+  const waiting = client.waitForReview(orgId, reviewId, {
+    signal: controller.signal,
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  controller.abort(reason);
+
+  await assert.rejects(waiting, (error) => error === reason);
+  assert.equal(fixture.calls.length, 1);
+});
+
 test("pagination keeps filters and refuses cycles, incomplete metadata and resource bounds", async (t) => {
   let mode = "normal";
   const fixture = await server(t, (request, response) => {

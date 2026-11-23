@@ -183,6 +183,7 @@ async function decoded(
   signal: AbortSignal,
   waitTimeout: boolean,
   decode: (text: string, headers: Headers) => unknown,
+  callerSignal?: AbortSignal,
 ): Promise<unknown> {
   const reader = response.body?.getReader();
   if (!reader) {
@@ -225,6 +226,7 @@ async function decoded(
       return undefined;
     }
   } catch (error) {
+    if (callerSignal?.aborted) throw callerSignal.reason;
     if (error instanceof ProoflineError) throw error;
     if (response.ok && (signal.aborted || performance.now() >= deadline))
       throw new ProoflineError(
@@ -400,8 +402,30 @@ function httpDate(value: string): number {
     : Number.NaN;
 }
 
-export function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+export function sleep(
+  milliseconds: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener("abort", abort);
+
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, milliseconds);
+
+    const abort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(signal?.reason);
+    };
+
+    signal?.addEventListener("abort", abort, { once: true });
+
+    if (signal?.aborted) abort();
+  });
 }
 
 export class Transport {
@@ -437,6 +461,7 @@ export class Transport {
       JSON.parse(text),
     accept = "application/json, application/problem+json",
     mcpPhase?: "initialize" | "notification" | "call",
+    callerSignal?: AbortSignal,
   ): Promise<T> {
     const path = Object.entries(parameters.path ?? {}).reduce(
       (value, [key, coordinateValue]) =>
@@ -454,6 +479,7 @@ export class Transport {
     if (mcpPhase && new TextEncoder().encode(requestBody).length > 8192)
       throw new TypeError("MCP request exceeds 8192 bytes");
     for (let attempt = 0; ; attempt += 1) {
+      callerSignal?.throwIfAborted();
       const headers = new Headers({
         Accept: accept,
         "User-Agent": `proofline-typescript/${VERSION}`,
@@ -479,7 +505,10 @@ export class Transport {
           "the request deadline expired",
         );
       const requestDeadline = now + remaining;
-      const signal = AbortSignal.timeout(Math.ceil(remaining));
+      const timeoutSignal = AbortSignal.timeout(Math.ceil(remaining));
+      const signal = callerSignal
+        ? AbortSignal.any([callerSignal, timeoutSignal])
+        : timeoutSignal;
       let response: Response;
       try {
         response = await fetch(url, {
@@ -491,6 +520,7 @@ export class Transport {
           signal,
         });
       } catch {
+        if (callerSignal?.aborted) throw callerSignal.reason;
         if (signal.aborted && waitTimeout)
           throw new ProoflineError(
             0,
@@ -527,6 +557,7 @@ export class Transport {
         signal,
         waitTimeout,
         decode,
+        callerSignal,
       );
       if (response.ok) return value as T;
       const error = problem(response.status, value, this.#token);
@@ -545,7 +576,7 @@ export class Transport {
           "the review timeout expires before the server permits a retry",
         );
       }
-      await sleep(delay);
+      await sleep(delay, callerSignal);
     }
   }
 }
